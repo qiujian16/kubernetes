@@ -1183,8 +1183,9 @@ func (proxier *Proxier) syncProxyRules() {
 				// Each rule is a probabilistic match.
 				args = append(args,
 					"-m", "statistic",
-					"--mode", "random",
-					"--probability", fmt.Sprintf("%0.5f", 1.0/float64(n-i)))
+					"--mode", "nth",
+					"--every", fmt.Sprintf("%d", n-i),
+					"--packet", "0")
 			}
 			// The final (or only if n == 1) rule is a guaranteed match.
 			args = append(args, "-j", string(endpointChain))
@@ -1262,8 +1263,9 @@ func (proxier *Proxier) syncProxyRules() {
 					// Each rule is a probabilistic match.
 					args = append(args,
 						"-m", "statistic",
-						"--mode", "random",
-						"--probability", fmt.Sprintf("%0.5f", 1.0/float64(numLocalEndpoints-i)))
+						"--mode", "nth",
+						"--every", fmt.Sprintf("%d", n-i),
+						"--packet", "0")
 				}
 				// The final (or only if n == 1) rule is a guaranteed match.
 				args = append(args, "-j", string(endpointChain))
