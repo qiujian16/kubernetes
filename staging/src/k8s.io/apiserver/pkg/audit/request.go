@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	authnv1 "k8s.io/api/authentication/v1"
@@ -94,6 +95,19 @@ func LogImpersonatedUser(ae *auditinternal.Event, user user.Info) {
 	ae.ImpersonatedUser.Extra = map[string]authnv1.ExtraValue{}
 	for k, v := range user.GetExtra() {
 		ae.ImpersonatedUser.Extra[k] = authnv1.ExtraValue(v)
+	}
+}
+
+// LogActAsUser fills in the actas user annotation into an audit event.
+func LogActAsUser(ae *auditinternal.Event, user user.Info) {
+	if ae == nil || ae.Level.Less(auditinternal.LevelMetadata) {
+		return
+	}
+	ae.Annotations["act-as-user"] = user.GetName()
+	ae.Annotations["act-as-groups"] = strings.Join(user.GetGroups(), ",")
+	ae.Annotations["act-as-uid"] = user.GetUID()
+	for k, v := range user.GetExtra() {
+		ae.Annotations[strings.ToLower(k)] = strings.Join(v, ",")
 	}
 }
 

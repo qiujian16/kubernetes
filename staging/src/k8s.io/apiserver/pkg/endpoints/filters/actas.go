@@ -3,11 +3,8 @@ package filters
 import (
 	"errors"
 	"fmt"
-	authenticationv1 "k8s.io/api/authentication/v1"
-	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/audit"
-	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
@@ -27,13 +24,13 @@ const (
 
 func WithActAs(handler http.Handler, a authorizer.Authorizer, s runtime.NegotiatedSerializer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		actAsRequests, err := buildActAsRequests(req.Header)
+		actAsUser, isActAsRequest, err := buildActAsUserInfo(req.Header)
 		if err != nil {
 			klog.V(4).Infof("%v", err)
 			responsewriters.InternalError(w, req, err)
 			return
 		}
-		if len(actAsRequests) == 0 {
+		if !isActAsRequest {
 			handler.ServeHTTP(w, req)
 			return
 		}
@@ -45,84 +42,22 @@ func WithActAs(handler http.Handler, a authorizer.Authorizer, s runtime.Negotiat
 			return
 		}
 
-		attributes, err := GetAuthorizerAttributes(ctx)
-		if err != nil {
-			responsewriters.InternalError(w, req, err)
-			return
+		// check if the real user has actas permission at all
+		actingAsAttributes := &authorizer.AttributesRecord{
+			User:            requestor,
+			Verb:            "actas",
+			Name:            "*",
+			Resource:        "*",
+			ResourceRequest: true,
 		}
-
-		// if groups are not specified, then we need to look them up differently depending on the type of user
-		// if they are specified, then they are the authority (including the inclusion of system:authenticated/system:unauthenticated groups)
-		groupsSpecified := len(req.Header[ActAsGroupHeader]) > 0
-
-		// make sure we're allowed to actas each thing we're requesting.  While we're iterating through, start building username
-		// and group information
-		username := ""
-		groups := []string{}
-		userExtra := map[string][]string{}
-		uid := ""
-		for _, actAsRequest := range actAsRequests {
-			gvk := actAsRequest.GetObjectKind().GroupVersionKind()
-			actingAsAttributes := &authorizer.AttributesRecord{
-				User:            requestor,
-				Verb:            "actas",
-				APIGroup:        gvk.Group,
-				APIVersion:      gvk.Version,
-				Namespace:       actAsRequest.Namespace,
-				Name:            actAsRequest.Name,
-				ResourceRequest: true,
-			}
-
-			switch gvk.GroupKind() {
-			case v1.SchemeGroupVersion.WithKind("ServiceAccount").GroupKind():
-				actingAsAttributes.Resource = "serviceaccounts"
-				username = serviceaccount.MakeUsername(actAsRequest.Namespace, actAsRequest.Name)
-				if !groupsSpecified {
-					// if groups aren't specified for a service account, we know the groups because its a fixed mapping.  Add them
-					groups = serviceaccount.MakeGroupNames(actAsRequest.Namespace)
-				}
-
-			case v1.SchemeGroupVersion.WithKind("User").GroupKind():
-				actingAsAttributes.Resource = "users"
-				username = actAsRequest.Name
-
-			case v1.SchemeGroupVersion.WithKind("Group").GroupKind():
-				actingAsAttributes.Resource = "groups"
-				groups = append(groups, actAsRequest.Name)
-
-			case authenticationv1.SchemeGroupVersion.WithKind("UserExtra").GroupKind():
-				extraKey := actAsRequest.FieldPath
-				extraValue := actAsRequest.Name
-				actingAsAttributes.Resource = "userextras"
-				actingAsAttributes.Subresource = extraKey
-				userExtra[extraKey] = append(userExtra[extraKey], extraValue)
-
-			case authenticationv1.SchemeGroupVersion.WithKind("UID").GroupKind():
-				uid = string(actAsRequest.Name)
-				actingAsAttributes.Resource = "uids"
-
-			default:
-				klog.V(4).InfoS("unknown actas request type", "request", actAsRequest)
-				responsewriters.Forbidden(ctx, actingAsAttributes, w, req, fmt.Sprintf("unknown actas request type: %v", actAsRequest), s)
-				return
-			}
-
-			decision, reason, err := a.Authorize(ctx, actingAsAttributes)
-			if err != nil || decision != authorizer.DecisionAllow {
-				klog.V(4).InfoS("Forbidden", "URI", req.RequestURI, "reason", reason, "err", err)
-				responsewriters.Forbidden(ctx, actingAsAttributes, w, req, reason, s)
-				return
-			}
-		}
-
-		authorized, reason, err := a.Authorize(ctx, attributes)
-		if err != nil || authorized != authorizer.DecisionAllow {
+		actAsDecision, reason, err := a.Authorize(ctx, actingAsAttributes)
+		if err != nil || actAsDecision != authorizer.DecisionAllow {
 			klog.V(4).InfoS("Forbidden", "URI", req.RequestURI, "reason", reason, "err", err)
-			responsewriters.Forbidden(ctx, attributes, w, req, reason, s)
+			responsewriters.Forbidden(ctx, actingAsAttributes, w, req, reason, s)
 			return
 		}
 
-		if username != user.Anonymous {
+		if actAsUser.Name != user.Anonymous {
 			// When acting as a non-anonymous user, include the 'system:authenticated' group
 			// in the acted user info:
 			// - if no groups were specified
@@ -131,7 +66,7 @@ func WithActAs(handler http.Handler, a authorizer.Authorizer, s runtime.Negotiat
 			// If 'system:unauthenticated' group has been specified we should not include
 			// the 'system:authenticated' group.
 			addAuthenticated := true
-			for _, group := range groups {
+			for _, group := range actAsUser.Groups {
 				if group == user.AllAuthenticated || group == user.AllUnauthenticated {
 					addAuthenticated = false
 					break
@@ -139,11 +74,11 @@ func WithActAs(handler http.Handler, a authorizer.Authorizer, s runtime.Negotiat
 			}
 
 			if addAuthenticated {
-				groups = append(groups, user.AllAuthenticated)
+				actAsUser.Groups = append(actAsUser.Groups, user.AllAuthenticated)
 			}
 		} else {
 			addUnauthenticated := true
-			for _, group := range groups {
+			for _, group := range actAsUser.Groups {
 				if group == user.AllUnauthenticated {
 					addUnauthenticated = false
 					break
@@ -151,23 +86,29 @@ func WithActAs(handler http.Handler, a authorizer.Authorizer, s runtime.Negotiat
 			}
 
 			if addUnauthenticated {
-				groups = append(groups, user.AllUnauthenticated)
+				actAsUser.Groups = append(actAsUser.Groups, user.AllUnauthenticated)
 			}
 		}
 
-		newUser := &user.DefaultInfo{
-			Name:   username,
-			Groups: groups,
-			Extra:  userExtra,
-			UID:    uid,
+		// authorize if the acctas user is authorized
+		attributes, err := GetAuthorizerAttributes(ctx)
+		if err != nil {
+			responsewriters.InternalError(w, req, err)
+			return
 		}
-		req = req.WithContext(request.WithUser(ctx, newUser))
+		attributes.User = actAsUser
+		decision, reason, err := a.Authorize(ctx, attributes)
+		if err != nil || decision != authorizer.DecisionAllow {
+			klog.V(4).InfoS("Forbidden", "URI", req.RequestURI, "reason", reason, "err", err)
+			responsewriters.Forbidden(ctx, attributes, w, req, reason, s)
+			return
+		}
 
 		oldUser, _ := request.UserFrom(ctx)
-		httplog.LogOf(req, w).Addf("%v is acting as %v", userString(oldUser), userString(newUser))
+		httplog.LogOf(req, w).Addf("%v is acting as %v", userString(oldUser), userString(actAsUser))
 
 		ae := audit.AuditEventFrom(ctx)
-		audit.LogImpersonatedUser(ae, newUser)
+		audit.LogActAsUser(ae, actAsUser)
 
 		// clear all the actas headers from the request
 		req.Header.Del(ActAsUserHeader)
@@ -183,23 +124,17 @@ func WithActAs(handler http.Handler, a authorizer.Authorizer, s runtime.Negotiat
 	})
 }
 
-func buildActAsRequests(headers http.Header) ([]v1.ObjectReference, error) {
-	actAsRequests := []v1.ObjectReference{}
+func buildActAsUserInfo(headers http.Header) (*user.DefaultInfo, bool, error) {
+	groups := []string{}
+	userExtra := map[string][]string{}
 
-	requestedUser := headers.Get(ActAsUserHeader)
-	hasUser := len(requestedUser) > 0
-	if hasUser {
-		if namespace, name, err := serviceaccount.SplitUsername(requestedUser); err == nil {
-			actAsRequests = append(actAsRequests, v1.ObjectReference{Kind: "ServiceAccount", Namespace: namespace, Name: name})
-		} else {
-			actAsRequests = append(actAsRequests, v1.ObjectReference{Kind: "User", Name: requestedUser})
-		}
-	}
+	username := headers.Get(ActAsUserHeader)
+	hasUser := len(username) > 0
 
 	hasGroups := false
 	for _, group := range headers[ActAsGroupHeader] {
 		hasGroups = true
-		actAsRequests = append(actAsRequests, v1.ObjectReference{Kind: "Group", Name: group})
+		groups = append(groups, group)
 	}
 
 	hasUserExtra := false
@@ -213,33 +148,24 @@ func buildActAsRequests(headers http.Header) ([]v1.ObjectReference, error) {
 
 		// make a separate request for each extra value they're trying to set
 		for _, value := range values {
-			actAsRequests = append(actAsRequests,
-				v1.ObjectReference{
-					Kind: "UserExtra",
-					// we only parse out a group above, but the parsing will fail if there isn't SOME version
-					// using the internal version will help us fail if anyone starts using it
-					APIVersion: authenticationv1.SchemeGroupVersion.String(),
-					Name:       value,
-					// ObjectReference doesn't have a subresource field.  FieldPath is close and available, so we'll use that
-					// TODO fight the good fight for ObjectReference to refer to resources and subresources
-					FieldPath: extraKey,
-				})
+			userExtra[extraKey] = append(userExtra[extraKey], value)
 		}
 	}
 
-	requestedUID := headers.Get(ActAsUID)
-	hasUID := len(requestedUID) > 0
-	if hasUID {
-		actAsRequests = append(actAsRequests, v1.ObjectReference{
-			Kind:       "UID",
-			Name:       requestedUID,
-			APIVersion: authenticationv1.SchemeGroupVersion.String(),
-		})
-	}
+	uid := headers.Get(ActAsUID)
+	hasUID := len(uid) > 0
 
 	if (hasGroups || hasUserExtra || hasUID) && !hasUser {
-		return nil, fmt.Errorf("requested %v without acting as a user", actAsRequests)
+		return nil, true, fmt.Errorf("requested without acting as a user")
+	} else if !hasUser {
+		// no actas headers are set.
+		return nil, false, nil
 	}
 
-	return actAsRequests, nil
+	return &user.DefaultInfo{
+		Name:   username,
+		Groups: groups,
+		Extra:  userExtra,
+		UID:    uid,
+	}, true, nil
 }
