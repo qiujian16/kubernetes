@@ -97,7 +97,7 @@ func withAuthorization(handler http.Handler, a authorizer.Authorizer, s runtime.
 	})
 }
 
-func GetAuthorizerAttributes(ctx context.Context) (authorizer.Attributes, error) {
+func GetAuthorizerAttributes(ctx context.Context) (*authorizer.AttributesRecord, error) {
 	attribs := authorizer.AttributesRecord{}
 
 	user, ok := request.UserFrom(ctx)

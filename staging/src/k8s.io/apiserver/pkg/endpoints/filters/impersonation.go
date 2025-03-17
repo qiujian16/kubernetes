@@ -58,6 +58,36 @@ func WithImpersonation(handler http.Handler, a authorizer.Authorizer, s runtime.
 			return
 		}
 
+		// Check if the request is authorized on impersonating the resource
+		impersonateOnAttributes, err := GetAuthorizerAttributes(ctx)
+		if err != nil {
+			klog.V(4).Infof("%v", err)
+			responsewriters.InternalError(w, req, err)
+			return
+		}
+		/* set verb to impersonate-on
+		   e.g. the rules to set for impersonating a certain resource needs to be
+		   # 1st rule allows impersonate as users
+		   - apiGroups: [""]
+		     resources:
+		     - users
+		     verbs:
+		     - impersonate
+		   # 2nd rule allows impersonate on the certain resource/subresource
+		   - apiGroups:
+		     - subresources.kubevirt.io
+		     resources:
+		     - virtualmachines/console
+		     verbs: impersonate-on
+		*/
+		impersonateOnAttributes.Verb = "impersonate-on"
+		decision, reason, err := a.Authorize(ctx, impersonateOnAttributes)
+		if err != nil || decision != authorizer.DecisionAllow {
+			klog.V(4).InfoS("Forbidden", "URI", req.RequestURI, "reason", reason, "err", err)
+			responsewriters.Forbidden(ctx, impersonateOnAttributes, w, req, reason, s)
+			return
+		}
+
 		// if groups are not specified, then we need to look them up differently depending on the type of user
 		// if they are specified, then they are the authority (including the inclusion of system:authenticated/system:unauthenticated groups)
 		groupsSpecified := len(req.Header[authenticationv1.ImpersonateGroupHeader]) > 0
